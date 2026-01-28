@@ -10,8 +10,12 @@
     ]
   },
   "scripts": {
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "vitest run --exclude '**/integration.test.ts'",
+    "test:watch": "vitest --exclude '**/integration.test.ts'",
+    "test:integration": "vitest run tests/integration.test.ts",
+    "test:all": "vitest run",
+    "test:db:up": "docker-compose -f docker-compose.test.yml up -d && sleep 3",
+    "test:db:down": "docker-compose -f docker-compose.test.yml down -v",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
@@ -32,6 +36,7 @@
   },
   "devDependencies": {
     "@types/pg": "^8.11.0",
+    "@types/pg-format": "^1.0.5",
     "typescript": "^5.0.0",
     "vitest": "^4.0.18"
   },
