@@ -31,5 +31,5 @@ coverage/
 *.log
 npm-debug.log*
 
-# Lock files (optional - uncomment to ignore)
-# package-lock.json
+# Lock files (generated during install)
+package-lock.json
