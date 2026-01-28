@@ -1,0 +1,41 @@
+{
+  "name": "@clawdbot/memory-pgvector",
+  "version": "0.3.0",
+  "description": "PostgreSQL + pgvector memory backend for Clawdbot with multi-agent isolation",
+  "type": "module",
+  "main": "index.ts",
+  "clawdbot": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "clawdbot",
+    "memory",
+    "pgvector",
+    "postgresql",
+    "embeddings",
+    "vector-search"
+  ],
+  "author": "PostgresAI",
+  "license": "MIT",
+  "dependencies": {
+    "@sinclair/typebox": "^0.32.0",
+    "openai": "^4.0.0",
+    "pg": "^8.13.0",
+    "pg-format": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "clawdbot": ">=2025.1.0"
+  }
+}

@@ -1,0 +1,754 @@
+/**
+ * PostgreSQL + pgvector database operations
+ * 
+ * Features:
+ * - Partitioned tables by agent_id for better multi-tenancy
+ * - Row Level Security (RLS) for agent isolation
+ * - Per-partition HNSW indexes for optimal performance
+ * - Hybrid search (vector + full-text)
+ */
+
+import { Pool, PoolClient } from "pg";
+import { randomUUID } from "node:crypto";
+import format from "pg-format";
+import type { 
+  ConnectionConfig, 
+  MemoryCategory,
+  SearchConfig 
+} from "./config.js";
+
+export interface MemoryEntry {
+  id: string;
+  agentId: string;
+  text: string;
+  embedding: number[];
+  importance: number;
+  category: MemoryCategory;
+  source: "manual" | "auto-capture" | "session";
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface MemorySearchResult {
+  entry: Omit<MemoryEntry, "embedding">;
+  score: number;
+}
+
+export interface StoreParams {
+  agentId: string;
+  text: string;
+  embedding: number[];
+  importance?: number;
+  category?: MemoryCategory;
+  source?: MemoryEntry["source"];
+  metadata?: Record<string, unknown>;
+}
+
+export class MemoryDB {
+  private pool: Pool;
+  private vectorDims: number;
+  private indexType: "hnsw" | "ivfflat";
+  private ftsLanguage: string;
+  private initialized = false;
+  private initPromise: Promise<void> | null = null;
+  private knownPartitions: Set<string> = new Set();
+
+  constructor(params: {
+    connection?: ConnectionConfig;
+    connectionString?: string;
+    vectorDims: number;
+    indexType: "hnsw" | "ivfflat";
+    ftsLanguage?: string;
+  }) {
+    this.vectorDims = params.vectorDims;
+    this.indexType = params.indexType;
+    this.ftsLanguage = params.ftsLanguage ?? "english";
+
+    // Connection pool configuration
+    const poolConfig = {
+      max: 10, // connection pool size
+      idleTimeoutMillis: 30000, // close idle connections after 30s
+      connectionTimeoutMillis: 5000, // fail fast if can't connect in 5s
+    };
+
+    if (params.connectionString) {
+      this.pool = new Pool({
+        connectionString: params.connectionString,
+        ...poolConfig,
+      });
+    } else {
+      this.pool = new Pool({
+        host: params.connection?.host ?? "localhost",
+        port: params.connection?.port ?? 5432,
+        database: params.connection?.database ?? "clawdbot_memory",
+        user: params.connection?.user ?? "clawdbot",
+        password: params.connection?.password,
+        ssl: params.connection?.ssl,
+        ...poolConfig,
+      });
+    }
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (this.initialized) return;
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = this.doInitialize();
+    return this.initPromise;
+  }
+
+  private async doInitialize(): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      // Enable pgvector extension
+      await client.query("create extension if not exists vector");
+
+      // Check if we're migrating from non-partitioned table
+      const tableExists = await client.query(`
+        select
+          exists (
+            select 1
+            from information_schema.tables
+            where
+              table_name = 'memories'
+              and table_schema = 'public'
+          )
+      `);
+
+      const isPartitioned = await client.query(`
+        select
+          exists (
+            select 1
+            from pg_partitioned_table as pt
+            inner join pg_class as pc
+              on pt.partrelid = pc.oid
+            where pc.relname = 'memories'
+          )
+      `);
+
+      if (tableExists.rows[0].exists && !isPartitioned.rows[0].exists) {
+        // Non-partitioned table exists - use legacy mode
+        // (User can migrate manually with migration script)
+        await this.initializeLegacy(client);
+      } else {
+        // Fresh install or already partitioned - use new schema
+        await this.initializePartitioned(client);
+      }
+
+      this.initialized = true;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Legacy initialization for backward compatibility
+   */
+  private async initializeLegacy(client: PoolClient): Promise<void> {
+    // Add FTS column if not exists
+    await client.query(`
+      do $$
+      begin
+        if not exists (
+          select 1
+          from information_schema.columns
+          where
+            table_name = 'memories'
+            and column_name = 'fts_vector'
+        ) then
+          alter table memories
+            add column fts_vector tsvector
+            generated always as (to_tsvector('english', text)) stored;
+        end if;
+      end $$;
+    `);
+
+    // Create indexes if they don't exist
+    const indexOps = "vector_cosine_ops";
+
+    await client.query(`
+      create index if not exists memories_embedding_idx
+        on memories
+        using ${this.indexType} (embedding ${indexOps})
+    `);
+
+    await client.query(`
+      create index if not exists memories_fts_idx
+        on memories
+        using gin (fts_vector)
+    `);
+
+    await client.query(`
+      create index if not exists memories_agent_idx
+        on memories (agent_id)
+    `);
+
+    await client.query(`
+      create index if not exists memories_category_idx
+        on memories (category)
+    `);
+  }
+
+  /**
+   * New partitioned table initialization with RLS
+   */
+  private async initializePartitioned(client: PoolClient): Promise<void> {
+    // Create partitioned memories table
+    // Comment: Multi-agent memory storage with vector search capabilities
+    await client.query(`
+      create table if not exists memories (
+        id uuid not null default gen_random_uuid(),
+        agent_id text not null,
+        text text not null,
+        embedding vector(${this.vectorDims}),
+        importance float default 0.7,
+        category text default 'other',
+        source text default 'manual',
+        metadata jsonb default '{}',
+        created_at timestamptz default now(),
+        updated_at timestamptz default now(),
+        fts_vector tsvector generated always as (to_tsvector('english', text)) stored,
+        primary key (agent_id, id)
+      ) partition by list (agent_id)
+    `);
+
+    // Add table comment
+    await client.query(`
+      comment on table memories is
+        'Long-term memory storage for Clawdbot agents with vector embeddings for semantic search'
+    `);
+
+    // Create default partition for unknown agents
+    await client.query(`
+      create table if not exists memories_default
+        partition of memories default
+    `);
+
+    // Create indexes on default partition
+    await this.createPartitionIndexes(client, "memories_default");
+
+    // Enable Row Level Security
+    await client.query(`alter table memories enable row level security`);
+
+    // Create RLS policy for agent isolation
+    // Uses InitPlan optimization: (select current_setting(...)) instead of direct call
+    await client.query(`
+      do $$
+      begin
+        if not exists (
+          select 1
+          from pg_policies
+          where
+            tablename = 'memories'
+            and policyname = 'agent_isolation'
+        ) then
+          create policy agent_isolation on memories
+            using (agent_id = (select current_setting('app.agent_id', true)));
+        end if;
+      end $$;
+    `);
+
+    // Load existing partitions
+    const partitions = await client.query(`
+      select inhrelid::regclass::text as partition_name
+      from pg_inherits
+      where inhparent = 'memories'::regclass
+    `);
+
+    for (const row of partitions.rows) {
+      const name = row.partition_name;
+      // Extract agent_id from partition name (memories_<agent_id>)
+      if (name.startsWith("memories_") && name !== "memories_default") {
+        const agentId = name.substring("memories_".length);
+        this.knownPartitions.add(agentId);
+      }
+    }
+  }
+
+  /**
+   * Create indexes for a partition
+   * Uses pg-format for safe identifier escaping
+   */
+  private async createPartitionIndexes(client: PoolClient, partitionName: string): Promise<void> {
+    const indexOps = "vector_cosine_ops";
+    const safeName = partitionName.replace(/[^a-z0-9_]/gi, "_");
+
+    // HNSW/IVFFlat index on embedding for vector similarity search
+    // Note: Cannot use CONCURRENTLY inside transaction, would need separate connection
+    await client.query(format(
+      `create index if not exists %I on %I using %s (embedding %s)`,
+      `${safeName}_embedding_idx`,
+      partitionName,
+      this.indexType,
+      indexOps
+    ));
+
+    // GIN index on FTS vector for full-text search
+    await client.query(format(
+      `create index if not exists %I on %I using gin (fts_vector)`,
+      `${safeName}_fts_idx`,
+      partitionName
+    ));
+
+    // Index on category for filtered queries
+    await client.query(format(
+      `create index if not exists %I on %I (category)`,
+      `${safeName}_category_idx`,
+      partitionName
+    ));
+  }
+
+  /**
+   * Ensure partition exists for an agent, create if not
+   */
+  private async ensurePartition(agentId: string): Promise<void> {
+    // Sanitize agent_id for use in table name
+    const safeAgentId = agentId.replace(/[^a-z0-9_]/gi, "_").toLowerCase();
+
+    if (this.knownPartitions.has(safeAgentId)) {
+      return;
+    }
+
+    const client = await this.pool.connect();
+    try {
+      const partitionName = `memories_${safeAgentId}`;
+
+      // Check if partition exists
+      const exists = await client.query(`
+        select
+          exists (
+            select 1
+            from pg_tables
+            where
+              tablename = $1
+              and schemaname = 'public'
+          )
+      `, [partitionName]);
+
+      if (!exists.rows[0].exists) {
+        // Create partition for this agent
+        // Use pg-format for safe identifier escaping
+        await client.query(format(
+          `create table if not exists %I partition of memories for values in (%L)`,
+          partitionName,
+          agentId
+        ));
+
+        // Create indexes on the new partition
+        await this.createPartitionIndexes(client, partitionName);
+      }
+
+      this.knownPartitions.add(safeAgentId);
+    } catch (err) {
+      // Partition might already exist (race condition) - that's fine
+      const error = err as Error;
+      if (!error.message?.includes("already exists")) {
+        throw err;
+      }
+      this.knownPartitions.add(safeAgentId);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Set the agent context for RLS
+   */
+  private async setAgentContext(client: PoolClient, agentId: string): Promise<void> {
+    await client.query(`select set_config('app.agent_id', $1, true)`, [agentId]);
+  }
+
+  async store(params: StoreParams): Promise<MemoryEntry> {
+    await this.ensureInitialized();
+    await this.ensurePartition(params.agentId);
+
+    const id = randomUUID();
+    const now = new Date();
+    
+    // Format embedding as pgvector string
+    const embeddingStr = `[${params.embedding.join(",")}]`;
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await this.setAgentContext(client, params.agentId);
+
+      const result = await client.query(
+        `insert into memories (
+          id,
+          agent_id,
+          text,
+          embedding,
+          importance,
+          category,
+          source,
+          metadata,
+          created_at,
+          updated_at
+        )
+        values ($1, $2, $3, $4::vector, $5, $6, $7, $8, $9, $9)
+        returning *`,
+        [
+          id,
+          params.agentId,
+          params.text,
+          embeddingStr,
+          params.importance ?? 0.7,
+          params.category ?? "other",
+          params.source ?? "manual",
+          JSON.stringify(params.metadata ?? {}),
+          now,
+        ]
+      );
+
+      await client.query("commit");
+      return this.rowToEntry(result.rows[0]);
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async search(params: {
+    agentId: string;
+    embedding: number[];
+    query: string;
+    config: SearchConfig;
+  }): Promise<MemorySearchResult[]> {
+    await this.ensureInitialized();
+
+    const embeddingStr = `[${params.embedding.join(",")}]`;
+    const limit = params.config.limit;
+    const candidateLimit = limit * 4; // Fetch more for hybrid merge
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await this.setAgentContext(client, params.agentId);
+
+      let result;
+
+      if (params.config.hybrid) {
+        // Hybrid search: combine vector similarity and full-text
+        // Uses GROUP BY to aggregate scores from both search methods
+        result = await client.query(
+          `with vector_results as (
+            select
+              mem.id,
+              mem.text,
+              mem.category,
+              mem.importance,
+              mem.source,
+              mem.metadata,
+              mem.created_at,
+              mem.updated_at,
+              mem.agent_id,
+              1 - (mem.embedding <=> $1::vector) as vector_score,
+              0::float as text_score
+            from memories as mem
+            where mem.agent_id = $2
+            order by mem.embedding <=> $1::vector
+            limit $3
+          ),
+          text_results as (
+            select
+              mem.id,
+              mem.text,
+              mem.category,
+              mem.importance,
+              mem.source,
+              mem.metadata,
+              mem.created_at,
+              mem.updated_at,
+              mem.agent_id,
+              0::float as vector_score,
+              ts_rank(mem.fts_vector, plainto_tsquery('english', $4)) as text_score
+            from memories as mem
+            where
+              mem.agent_id = $2
+              and mem.fts_vector @@ plainto_tsquery('english', $4)
+            order by text_score desc
+            limit $3
+          ),
+          combined as (
+            select * from vector_results
+            union all
+            select * from text_results
+          ),
+          aggregated as (
+            select
+              combined.id,
+              combined.text,
+              combined.category,
+              combined.importance,
+              combined.source,
+              combined.metadata,
+              combined.created_at,
+              combined.updated_at,
+              combined.agent_id,
+              max(combined.vector_score) as max_vector_score,
+              max(combined.text_score) as max_text_score
+            from combined
+            group by
+              combined.id,
+              combined.text,
+              combined.category,
+              combined.importance,
+              combined.source,
+              combined.metadata,
+              combined.created_at,
+              combined.updated_at,
+              combined.agent_id
+          )
+          select
+            aggregated.id,
+            aggregated.text,
+            aggregated.category,
+            aggregated.importance,
+            aggregated.source,
+            aggregated.metadata,
+            aggregated.created_at,
+            aggregated.updated_at,
+            aggregated.agent_id,
+            ($5 * aggregated.max_vector_score + $6 * aggregated.max_text_score) as score
+          from aggregated
+          order by score desc
+          limit $7`,
+          [
+            embeddingStr,
+            params.agentId,
+            candidateLimit,
+            params.query,
+            params.config.vectorWeight,
+            params.config.textWeight,
+            limit,
+          ]
+        );
+      } else {
+        // Vector-only search
+        result = await client.query(
+          `select
+            mem.id,
+            mem.text,
+            mem.category,
+            mem.importance,
+            mem.source,
+            mem.metadata,
+            mem.created_at,
+            mem.updated_at,
+            mem.agent_id,
+            1 - (mem.embedding <=> $1::vector) as score
+          from memories as mem
+          where mem.agent_id = $2
+          order by mem.embedding <=> $1::vector
+          limit $3`,
+          [embeddingStr, params.agentId, limit]
+        );
+      }
+
+      await client.query("commit");
+
+      return result.rows
+        .filter((row) => this.toNumber(row.score) >= params.config.minScore)
+        .map((row) => ({
+          entry: this.rowToEntryWithoutEmbedding(row),
+          score: this.toNumber(row.score),
+        }));
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async findSimilar(params: {
+    agentId: string;
+    embedding: number[];
+    threshold: number;
+  }): Promise<MemorySearchResult[]> {
+    await this.ensureInitialized();
+
+    const embeddingStr = `[${params.embedding.join(",")}]`;
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await this.setAgentContext(client, params.agentId);
+
+      const result = await client.query(
+        `select
+          mem.id,
+          mem.text,
+          mem.category,
+          mem.importance,
+          mem.source,
+          mem.metadata,
+          mem.created_at,
+          mem.updated_at,
+          mem.agent_id,
+          1 - (mem.embedding <=> $1::vector) as score
+        from memories as mem
+        where
+          mem.agent_id = $2
+          and 1 - (mem.embedding <=> $1::vector) >= $3
+        order by score desc
+        limit 1`,
+        [embeddingStr, params.agentId, params.threshold]
+      );
+
+      await client.query("commit");
+
+      return result.rows.map((row) => ({
+        entry: this.rowToEntryWithoutEmbedding(row),
+        score: this.toNumber(row.score),
+      }));
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Delete a memory by ID
+   * Requires agent_id for tenant isolation (no cross-tenant deletion)
+   */
+  async delete(id: string, agentId: string): Promise<boolean> {
+    await this.ensureInitialized();
+
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(id)) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
+
+    if (!agentId) {
+      throw new Error("agentId is required for delete operation");
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await this.setAgentContext(client, agentId);
+
+      const result = await client.query(
+        `delete from memories
+        where
+          id = $1
+          and agent_id = $2`,
+        [id, agentId]
+      );
+
+      await client.query("commit");
+      return (result.rowCount ?? 0) > 0;
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async count(agentId: string): Promise<number> {
+    await this.ensureInitialized();
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      await this.setAgentContext(client, agentId);
+
+      const result = await client.query(
+        `select count(*) as count
+        from memories
+        where agent_id = $1`,
+        [agentId]
+      );
+
+      await client.query("commit");
+      return parseInt(result.rows[0].count, 10);
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Get database health status
+   */
+  async healthCheck(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const result = await this.pool.query("select 1 as check");
+      return { ok: result.rows[0].check === 1 };
+    } catch (err) {
+      const error = err as Error;
+      return { ok: false, error: error.message };
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+
+  private rowToEntry(row: Record<string, unknown>): MemoryEntry {
+    return {
+      id: row.id as string,
+      agentId: row.agent_id as string,
+      text: row.text as string,
+      embedding: this.parseEmbedding(row.embedding),
+      importance: this.toNumber(row.importance),
+      category: row.category as MemoryCategory,
+      source: row.source as MemoryEntry["source"],
+      metadata: row.metadata as Record<string, unknown>,
+      createdAt: new Date(row.created_at as string),
+      updatedAt: new Date(row.updated_at as string),
+    };
+  }
+
+  private rowToEntryWithoutEmbedding(
+    row: Record<string, unknown>
+  ): Omit<MemoryEntry, "embedding"> {
+    return {
+      id: row.id as string,
+      agentId: row.agent_id as string,
+      text: row.text as string,
+      importance: this.toNumber(row.importance),
+      category: row.category as MemoryCategory,
+      source: row.source as MemoryEntry["source"],
+      metadata: row.metadata as Record<string, unknown>,
+      createdAt: new Date(row.created_at as string),
+      updatedAt: new Date(row.updated_at as string),
+    };
+  }
+
+  /**
+   * Safely convert a value to number
+   * pg driver may return numbers as numbers or strings depending on column type
+   */
+  private toNumber(value: unknown): number {
+    if (typeof value === "number") {
+      return value;
+    }
+    if (typeof value === "string") {
+      return parseFloat(value);
+    }
+    return 0;
+  }
+
+  private parseEmbedding(value: unknown): number[] {
+    if (typeof value === "string") {
+      // pgvector returns "[1,2,3]" format
+      const clean = value.replace(/[\[\]]/g, "");
+      return clean.split(",").map((s) => parseFloat(s));
+    }
+    if (Array.isArray(value)) {
+      return value.map((v) => this.toNumber(v));
+    }
+    return [];
+  }
+}
