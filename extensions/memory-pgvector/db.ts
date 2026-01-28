@@ -245,7 +245,9 @@ export class MemoryDB {
     await this.createPartitionIndexes(client, "memories_default");
 
     // Enable Row Level Security
+    /* Enable and FORCE RLS - force applies RLS even to table owner */
     await client.query(`alter table memories enable row level security`);
+    await client.query(`alter table memories force row level security`);
 
     // Create RLS policy for agent isolation
     // Uses InitPlan optimization: (select current_setting(...)) instead of direct call
