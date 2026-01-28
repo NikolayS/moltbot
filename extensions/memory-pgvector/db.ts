@@ -302,7 +302,10 @@ export class MemoryDB {
    */
   private async ensurePartition(agentId: string): Promise<void> {
     // Sanitize agent_id for use in table name
-    const safeAgentId = agentId.replace(/[^a-z0-9_]/gi, "_").toLowerCase();
+    // Use hash suffix to prevent collisions (e.g., "agent-1" vs "agent_1")
+    const sanitized = agentId.replace(/[^a-z0-9_]/gi, "_").toLowerCase();
+    const hash = Buffer.from(agentId).toString("base64url").slice(0, 8);
+    const safeAgentId = `${sanitized}_${hash}`;
 
     if (this.knownPartitions.has(safeAgentId)) {
       return;
