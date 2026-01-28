@@ -145,8 +145,8 @@ export class MemoryDB {
    * Legacy initialization for backward compatibility
    */
   private async initializeLegacy(client: PoolClient): Promise<void> {
-    // Add FTS column if not exists
-    await client.query(`
+    // Add FTS column if not exists (uses configured language)
+    await client.query(format(`
       do $$
       begin
         if not exists (
@@ -158,30 +158,28 @@ export class MemoryDB {
         ) then
           alter table memories
             add column fts_vector tsvector
-            generated always as (to_tsvector('english', text)) stored;
+            generated always as (to_tsvector(%L, text)) stored;
         end if;
       end $$;
-    `);
+    `, this.ftsLanguage));
 
     // Create indexes if they don't exist
+    // Using pg-format to safely escape identifiers
     const indexOps = "vector_cosine_ops";
 
-    await client.query(`
-      create index if not exists memories_embedding_idx
-        on memories
-        using ${this.indexType} (embedding ${indexOps})
-    `);
+    await client.query(format(
+      `create index if not exists memories_embedding_idx on memories using %s (embedding %s)`,
+      this.indexType,
+      indexOps
+    ));
 
-    await client.query(`
-      create index if not exists memories_fts_idx
-        on memories
-        using gin (fts_vector)
-    `);
+    await client.query(
+      `create index if not exists memories_fts_idx on memories using gin (fts_vector)`
+    );
 
-    await client.query(`
-      create index if not exists memories_agent_idx
-        on memories (agent_id)
-    `);
+    await client.query(
+      `create index if not exists memories_agent_idx on memories (agent_id)`
+    );
 
     await client.query(`
       create index if not exists memories_category_idx
@@ -195,22 +193,23 @@ export class MemoryDB {
   private async initializePartitioned(client: PoolClient): Promise<void> {
     // Create partitioned memories table
     // Comment: Multi-agent memory storage with vector search capabilities
-    await client.query(`
+    // Uses configured FTS language for full-text search
+    await client.query(format(`
       create table if not exists memories (
         id uuid not null default gen_random_uuid(),
         agent_id text not null,
         text text not null,
-        embedding vector(${this.vectorDims}),
+        embedding vector(%s),
         importance float default 0.7,
         category text default 'other',
         source text default 'manual',
         metadata jsonb default '{}',
         created_at timestamptz default now(),
         updated_at timestamptz default now(),
-        fts_vector tsvector generated always as (to_tsvector('english', text)) stored,
+        fts_vector tsvector generated always as (to_tsvector(%L, text)) stored,
         primary key (agent_id, id)
       ) partition by list (agent_id)
-    `);
+    `, this.vectorDims, this.ftsLanguage));
 
     // Add table comment
     await client.query(`
@@ -433,8 +432,9 @@ export class MemoryDB {
       if (params.config.hybrid) {
         // Hybrid search: combine vector similarity and full-text
         // Uses GROUP BY to aggregate scores from both search methods
+        // FTS language is configurable via this.ftsLanguage
         result = await client.query(
-          `with vector_results as (
+          format(`with vector_results as (
             select
               mem.id,
               mem.text,
@@ -464,11 +464,11 @@ export class MemoryDB {
               mem.updated_at,
               mem.agent_id,
               0::float as vector_score,
-              ts_rank(mem.fts_vector, plainto_tsquery('english', $4)) as text_score
+              ts_rank(mem.fts_vector, plainto_tsquery(%L, $4)) as text_score
             from memories as mem
             where
               mem.agent_id = $2
-              and mem.fts_vector @@ plainto_tsquery('english', $4)
+              and mem.fts_vector @@ plainto_tsquery(%L, $4)
             order by text_score desc
             limit $3
           ),
@@ -515,7 +515,7 @@ export class MemoryDB {
             ($5 * aggregated.max_vector_score + $6 * aggregated.max_text_score) as score
           from aggregated
           order by score desc
-          limit $7`,
+          limit $7`, this.ftsLanguage, this.ftsLanguage),
           [
             embeddingStr,
             params.agentId,

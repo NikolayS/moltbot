@@ -54,10 +54,16 @@ class EmbeddingCache {
   set(text: string, vector: number[]): void {
     // Evict oldest if at capacity
     if (this.cache.size >= this.maxSize) {
-      const oldest = this.cache.keys().next().value;
-      if (oldest) this.cache.delete(oldest);
+      const oldest = this.cache.keys().next();
+      if (!oldest.done && oldest.value) {
+        this.cache.delete(oldest.value);
+      }
     }
     this.cache.set(text, { vector, ts: Date.now() });
+  }
+
+  clear(): void {
+    this.cache.clear();
   }
 }
 
@@ -297,6 +303,7 @@ const memoryPgvectorPlugin = {
         connectionString: cfg.connectionString,
         vectorDims,
         indexType: cfg.indexType,
+        ftsLanguage: cfg.ftsLanguage,
       });
     } catch (err) {
       const error = err as Error;
@@ -673,7 +680,8 @@ const memoryPgvectorPlugin = {
         }
         if (!dbAvailable) return;
 
-        try {
+        // Define the capture logic as a separate async function
+        const captureMemories = async (): Promise<void> => {
           const agentId = getAgentId(event);
 
           // Extract text from messages
@@ -732,9 +740,21 @@ const memoryPgvectorPlugin = {
           if (stored > 0) {
             api.logger.info(`memory-pgvector: auto-captured ${stored} memories`);
           }
-        } catch (err) {
-          api.logger.warn(`memory-pgvector: capture failed: ${String(err)}`);
-          // Don't let memory failures break the agent
+        };
+
+        // Fire-and-forget or blocking based on config
+        if (cfg.asyncCapture) {
+          // Don't await - run in background without blocking agent response
+          void captureMemories().catch((err) =>
+            api.logger.error(`memory-pgvector: async capture failed: ${(err as Error).message}`)
+          );
+        } else {
+          // Legacy blocking behavior
+          try {
+            await captureMemories();
+          } catch (err) {
+            api.logger.warn(`memory-pgvector: capture failed: ${String(err)}`);
+          }
         }
       });
     }
@@ -763,6 +783,7 @@ const memoryPgvectorPlugin = {
         }
       },
       stop: async () => {
+        embeddingCache.clear();
         await db.close();
         api.logger.info("memory-pgvector: stopped");
       },
