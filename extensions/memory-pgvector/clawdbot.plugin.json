@@ -1,0 +1,20 @@
+{
+  "id": "memory-pgvector",
+  "kind": "memory",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "connectionString": { "type": "string" },
+      "embedding": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "default": "text-embedding-3-small" },
+          "apiKey": { "type": "string" },
+          "baseUrl": { "type": "string" }
+        }
+      },
+      "ftsLanguage": { "type": "string", "default": "english" },
+      "autoRecall": { "type": "boolean", "default": true }
+    }
+  }
+}
