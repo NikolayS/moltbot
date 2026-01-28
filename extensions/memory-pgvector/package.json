@@ -31,7 +31,7 @@
   "dependencies": {
     "@sinclair/typebox": "^0.32.0",
     "openai": "^4.0.0",
-    "pg": "^8.13.0",
+    "pg": "^8.17.2",
     "pg-format": "^1.0.4"
   },
   "devDependencies": {
