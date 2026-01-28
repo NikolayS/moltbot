@@ -100,8 +100,26 @@ export class MemoryDB {
   private async doInitialize(): Promise<void> {
     const client = await this.pool.connect();
     try {
-      // Enable pgvector extension
-      await client.query("create extension if not exists vector");
+      /* Check if pgvector extension exists, create only if missing and we have permission */
+      const extCheck = await client.query(`
+        select exists (
+          select 1 from pg_extension where extname = 'vector'
+        ) as installed
+      `);
+      
+      if (!extCheck.rows[0].installed) {
+        try {
+          await client.query("create extension if not exists vector");
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes("permission denied")) {
+            throw new Error(
+              "pgvector extension not installed. Run as superuser: create extension vector;"
+            );
+          }
+          throw err;
+        }
+      }
 
       // Check if we're migrating from non-partitioned table
       const tableExists = await client.query(`
